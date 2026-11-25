@@ -6,7 +6,9 @@
 struct iosrq
 {
   int fd;
-  u32 events;
+  u32 op;
+  void *buffer;
+  usz size;
 };
 
 coroutine$ (isz, aread, {
@@ -14,7 +16,6 @@ coroutine$ (isz, aread, {
   void *buffer;
   usz size;
 
-  usz offset;
   struct iosrq srq;
 });
 int aread (void *);
@@ -29,11 +30,9 @@ coroutine$ (isz, awrite, {
 });
 int awrite (void *);
 
-bstnod$ (timernod, 0);
 struct timersrq
 {
   u64 deadline;
-  struct timernod timernod;
   struct corosuperblk *kont;
 };
 

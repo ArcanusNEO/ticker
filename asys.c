@@ -1,51 +1,45 @@
 #include "asys.h"
-#include <sys/epoll.h>
+#include <liburing.h>
 
 int
 aread (void *kf) async$ ((struct aread *)kf)
 {
-  $.srq = (struct iosrq){ $.fd, EPOLLIN | EPOLLET | EPOLLONESHOT };
-  while ($.offset < $.size)
+  $.srq = (struct iosrq){
+    .fd = $.fd, .op = IORING_OP_READ, .buffer = $.buffer, .size = $.size
+  };
+  isz n;
+  do
     {
-      isz n = read ($.fd, (byte *)$.buffer + $.offset, $.size - $.offset);
-      if (n > 0)
-        {
-          $.offset += n;
-          break;
-        }
-      if (n == 0)
-        break;
-      if (errno == EINTR)
-        continue;
-      if (errno != EAGAIN && errno != EWOULDBLOCK)
-        return$ (-errno);
       $.mbr$ (super).srq = &$.srq;
       yield$ (EIO);
+      n = $.mbr$ (super).error;
     }
-  exit$ ((isz)$.offset);
+  while (n == -EINTR);
+  exit$ (n);
 }
 
 int
 awrite (void *kf) async$ ((struct awrite *)kf)
 {
-  $.srq = (struct iosrq){ $.fd, EPOLLOUT | EPOLLET | EPOLLONESHOT };
   while ($.offset < $.size)
     {
-      isz n
-          = write ($.fd, (const byte *)$.buffer + $.offset, $.size - $.offset);
-      if (n > 0)
+      $.srq = (struct iosrq){ .fd = $.fd,
+                              .op = IORING_OP_WRITE,
+                              .buffer = (byte *)$.buffer + $.offset,
+                              .size = $.size - $.offset };
+      isz n;
+      do
         {
-          $.offset += n;
-          continue;
+          $.mbr$ (super).srq = &$.srq;
+          yield$ (EIO);
+          n = $.mbr$ (super).error;
         }
-      if (n == 0)
+      while (n == -EINTR);
+      if (n < 0)
+        return$ (n);
+      if (!n)
         break;
-      if (errno == EINTR)
-        continue;
-      if (errno != EAGAIN && errno != EWOULDBLOCK)
-        return$ (-errno);
-      $.mbr$ (super).srq = &$.srq;
-      yield$ (EIO);
+      $.offset += n;
     }
   exit$ ((isz)$.offset);
 }

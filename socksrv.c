@@ -1,6 +1,8 @@
 #include "socksrv.h"
+#include <liburing.h>
+#include <poll.h>
 
-#define BUFFER_SIZE 4096
+#define TYPICAL_SIZE 4096
 
 static void
 accept_close (int sockfd, int *nullfd)
@@ -45,43 +47,39 @@ accept_spawn (int sockfd, int *nullfd, struct descriptor *q,
     }
 }
 
-static inline int
-timercmp (struct timernod *lhs, struct timernod *rhs)
+static struct io_uring_sqe *
+getsqe (struct io_uring *ring)
 {
-  u64 l = container_of (lhs, struct timersrq, timernod)->deadline;
-  u64 r = container_of (rhs, struct timersrq, timernod)->deadline;
-  return (l > r) - (l < r);
+  struct io_uring_sqe *sqe = io_uring_get_sqe (ring);
+  if (sqe || io_uring_submit (ring) < 0)
+    return sqe;
+  return io_uring_get_sqe (ring);
 }
 
-static struct timersrq *
-timermin (struct timernod **root)
+static void
+ringexit (struct io_uring **ringp)
 {
-  struct timernod *mn = *root;
-  if (!mn)
-    return null;
-  while (mn->left)
-    mn = mn->left;
-  *root = bst$ (splay) (mn);
-  return container_of (mn, struct timersrq, timernod);
+  io_uring_queue_exit (*ringp);
 }
 
 static struct descriptor
 sched_loop (int sockfd, struct descriptor q, void *(*spawn) (struct sockpeer))
 {
-  autofd int epfd = epoll_create1 (EPOLL_CLOEXEC);
-  if (epfd < 0)
-    return (struct descriptor){ .prop = "epoll_create1 < 0", .ident = errno };
-  struct epoll_event ev = { .events = EPOLLIN };
-  if (epoll_ctl (epfd, EPOLL_CTL_ADD, sockfd, &ev) < 0)
-    return (struct descriptor){ .prop = "epoll_ctl < 0", .ident = errno };
-  smartptr struct epoll_event *evs
-      = malloc (sizeof (struct epoll_event[BUFFER_SIZE]));
-  if (!evs)
-    return (struct descriptor){ .prop = "malloc == null", .ident = errno };
+  struct io_uring ring;
+  int ret = io_uring_queue_init (TYPICAL_SIZE, &ring, 0);
+  if (ret < 0)
+    return (struct descriptor){ .prop = "io_uring_queue_init < 0",
+                                .ident = -ret };
+  defer$ (ringexit) struct io_uring *ringp = &ring;
   autofd int nullfd = open ("/dev/null", O_RDONLY | O_CLOEXEC);
   if (nullfd < 0)
     return (struct descriptor){ .prop = "open < 0", .ident = errno };
-  struct timernod *timroot = null;
+  struct io_uring_sqe *sqe = getsqe (&ring);
+  if (!sqe)
+    return (struct descriptor){ .prop = "io_uring_get_sqe == null",
+                                .ident = ENOMEM };
+  io_uring_prep_poll_add (sqe, sockfd, POLLIN);
+  io_uring_sqe_set_data (sqe, null);
 
   for (struct descriptor nq = { 0 };; swap (q, nq))
     {
@@ -108,63 +106,77 @@ sched_loop (int sockfd, struct descriptor q, void *(*spawn) (struct sockpeer))
               case EIO:;
                 {
                   struct iosrq *srq = k->srq;
-                  struct epoll_event ev
-                      = { .events = srq->events, .data.ptr = k };
-                  if (epoll_ctl (epfd, EPOLL_CTL_ADD, srq->fd, &ev) < 0
-                      && (errno != EEXIST
-                          || epoll_ctl (epfd, EPOLL_CTL_MOD, srq->fd, &ev)
-                                 < 0))
-                    return (struct descriptor){ .prop = "epoll_ctl < 0",
-                                                .ident = errno };
+                  struct io_uring_sqe *sqe = getsqe (&ring);
+                  if (!sqe)
+                    return (struct descriptor){ .prop
+                                                = "io_uring_get_sqe == null",
+                                                .ident = ENOMEM };
+                  switch (srq->op)
+                    {
+                    case IORING_OP_READ:;
+                      io_uring_prep_read (sqe, srq->fd, srq->buffer, srq->size,
+                                          -1);
+                      break;
+                    case IORING_OP_WRITE:;
+                      io_uring_prep_write (sqe, srq->fd, srq->buffer,
+                                           srq->size, -1);
+                      break;
+                    default:;
+                      return (struct descriptor){ .prop = "srq->op invalid",
+                                                  .ident = EINVAL };
+                    }
+                  io_uring_sqe_set_data (sqe, k);
                   k = null;
                 }
                 break;
               case ETIMEDOUT:;
                 {
                   struct timersrq *te = k->srq;
-                  timroot = bst$ (ins) (timroot, &te->timernod, timercmp);
+                  struct io_uring_sqe *sqe = getsqe (&ring);
+                  if (!sqe)
+                    return (struct descriptor){ .prop
+                                                = "io_uring_get_sqe == null",
+                                                .ident = ENOMEM };
+                  u64 now = monotime$ ();
+                  /* the timeout value is inlined into the SQE as
+                     nanoseconds relative to the current monotonic clock */
+                  io_uring_prep_timeout (
+                      sqe,
+                      (void *)(uptr)(te->deadline > now ? te->deadline - now
+                                                        : 0),
+                      0, IORING_TIMEOUT_IMMEDIATE_ARG);
+                  io_uring_sqe_set_data (sqe, te->kont);
                   k = null;
                 }
                 break;
               }
         }
-      int timeout = nq.entry ? 0 : -1;
-      if (timroot && timeout < 0)
+      do
+        ret = io_uring_submit_and_wait (&ring, nq.entry ? 0 : 1);
+      while (ret == -EINTR);
+      if (ret < 0)
+        return (struct descriptor){ .prop = "io_uring_submit_and_wait < 0",
+                                    .ident = -ret };
+      struct io_uring_cqe *cqe;
+      while (!io_uring_peek_cqe (&ring, &cqe))
         {
-          struct timersrq *te = timermin (&timroot);
-          u64 now = monotime$ ();
-          u64 delta = te->deadline > now ? te->deadline - now : 0;
-          u64 ms = delta / 1000000 + (delta % 1000000 != 0);
-          timeout = ms > INT_MAX ? INT_MAX : (int)ms;
-        }
-      int ne = epoll_wait (epfd, evs, BUFFER_SIZE, timeout);
-      if (ne < 0)
-        {
-          if (errno == EINTR)
-            continue;
-          return (struct descriptor){ .prop = "epoll_wait < 0",
-                                      .ident = errno };
-        }
-      for (int i = 0; i < ne; ++i)
-        if (evs[i].data.ptr)
-          {
-            struct corosuperblk *k = evs[i].data.ptr;
-            xlist$ (push) (&k->lentry, &nq.entry, &nq.prop);
-          }
-        else
-          accept_spawn (sockfd, &nullfd, &nq, spawn);
-      if (timroot)
-        {
-          u64 now = monotime$ ();
-          xapr *prev = null, *next = nq.entry;
-          for (struct timersrq *te;
-               (te = timermin (&timroot)) && te->deadline <= now;)
+          struct corosuperblk *k = io_uring_cqe_get_data (cqe);
+          if (k)
             {
-              timroot = bst$ (rem) (&te->timernod);
-              xlist$ (ins) (&te->kont->lentry, prev, next, &nq.entry,
-                            &nq.prop);
-              prev = &te->kont->lentry;
+              k->error = cqe->res;
+              xlist$ (push) (&k->lentry, &nq.entry, &nq.prop);
             }
+          else
+            {
+              accept_spawn (sockfd, &nullfd, &nq, spawn);
+              struct io_uring_sqe *sqe = getsqe (&ring);
+              if (!sqe)
+                return (struct descriptor){ .prop = "io_uring_get_sqe == null",
+                                            .ident = ENOMEM };
+              io_uring_prep_poll_add (sqe, sockfd, POLLIN);
+              io_uring_sqe_set_data (sqe, null);
+            }
+          io_uring_cqe_seen (&ring, cqe);
         }
     }
   unreachable$ ();
@@ -189,7 +201,7 @@ socksrv (struct sockaddr *sockaddr, socklen_t sockaddrlen,
     return (struct descriptor){ .prop = "setsockopt < 0", .ident = errno };
   if (bind (sockfd, sockaddr, sockaddrlen))
     return (struct descriptor){ .prop = "bind < 0", .ident = errno };
-  if (listen (sockfd, BUFFER_SIZE) < 0)
+  if (listen (sockfd, TYPICAL_SIZE) < 0)
     return (struct descriptor){ .prop = "listen < 0", .ident = errno };
   return sched_loop (sockfd, initq, spawn);
 }
