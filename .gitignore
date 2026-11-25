@@ -1,0 +1,14 @@
+*
+!.git*
+!LICENSE
+!README
+!*.md
+!/doc
+!/doc/**/*
+
+!Makefile
+!.clang-format
+!*.h
+cmacs.h
+!*.c
+!*.inc
